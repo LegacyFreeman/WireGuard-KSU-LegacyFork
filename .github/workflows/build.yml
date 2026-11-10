@@ -1,119 +1,46 @@
-name: Build WireGuard-KSU
+name: Build Module
 
 on:
   push:
-    branches:
-      - main
-      - dev
-    tags:
-      - "v*"
+    branches: [main, master]
+  pull_request:
   workflow_dispatch:
-    inputs:
-      create_release:
-        description: "Опубликовать GitHub Release?"
-        type: boolean
-        required: true
-        default: true
-      verify_version:
-        description: "Проверить совпадение тега и версии в module.prop?"
-        type: boolean
-        required: true
-        default: true
-
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Чеккаут репозитория
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive # Важно, если есть сабмодули с исходниками WireGuard
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - name: Парсинг метаданных module.prop
-        id: metadata
+      - name: Install tools
         run: |
-          if [ ! -f module.prop ]; then
-            echo "::error title=Missing module.prop::Файл module.prop не найден!"
-            exit 1
-          fi
+          sudo apt-get update
+          sudo apt-get install -y git make file shellcheck zip unzip g++-aarch64-linux-gnu
 
-          VERSION=$(sed -n 's/^version=\([^ ]*\).*/\1/p' module.prop | sed 's/^v//')
-          VERSION_CODE=$(sed -n "s/^versionCode=//p" module.prop)
-          ID=$(sed -n "s/^id=//p" module.prop)
-
-          # Исправляем возможное задвоение буквы v (если в module.prop version=vX.Y.Z)
-          FILENAME="${ID}-v${VERSION}_(${VERSION_CODE}).zip"
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
-          echo "id=${ID}" >> "$GITHUB_OUTPUT"
-          echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
-
-          echo "📋 ID модуля: ${ID}"
-          echo "📋 Версия: v${VERSION} (${VERSION_CODE})"
-          echo "📦 Имя архива: ${FILENAME}"
-
-      - name: Проверка совпадения версии с тегом
-        if: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.verify_version == true) }}
+      - name: Read module metadata
+        id: meta
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            TAG_NAME="${{ github.ref_name }}"
-          else
-            TAG_NAME=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          fi
+          module_version="$(sed -n 's/^version=//p' module.prop)"
+          package_name="WireGuard-KSU-${module_version}.zip"
+          echo "module_version=${module_version}" >> "$GITHUB_OUTPUT"
+          echo "package_name=${package_name}" >> "$GITHUB_OUTPUT"
 
-          CLEAN_TAG=$(echo "$TAG_NAME" | sed 's/^v//')
-          MODULE_VERSION="${{ steps.metadata.outputs.version }}"
+      - name: Validate and test
+        run: sh scripts/ci/validate.sh
 
-          if [ -n "$TAG_NAME" ] && [ "$CLEAN_TAG" != "$MODULE_VERSION" ]; then
-            echo "::error title=Несовпадение версий::Версия в теге ($CLEAN_TAG) не совпадает с версией в module.prop ($MODULE_VERSION)!"
-            exit 1
-          fi
-          echo "✅ Проверка версий успешно пройдена!"
+      - name: Build wg tool for aarch64
+        run: sh scripts/ci/build-wg.sh
 
-      - name: Сборка / Упаковка модуля
-        run: |
-          mkdir -p _builds
-          
-          # Если в репозитории есть скрипт сборки build.sh, запускаем его, иначе просто пакуем в zip
-          if [ -f build.sh ]; then
-            chmod +x build.sh
-            ./build.sh
-          else
-            zip -r "_builds/${{ steps.metadata.outputs.filename }}" . -x ".git*" ".github*" "_builds/*" "*.md"
-          fi
+      - name: Create module package
+        run: sh scripts/ci/package-module.sh "dist/${{ steps.meta.outputs.package_name }}"
 
-          # Если build.sh складывает архив куда-то в другое место, копируем его в _builds с правильным именем
-          if [ -f *.zip ]; then
-            mv *.zip "_builds/${{ steps.metadata.outputs.filename }}" 2>/dev/null || true
-          fi
+      - name: Verify package contents
+        run: sh scripts/ci/verify-package.sh "dist/${{ steps.meta.outputs.package_name }}"
 
-      - name: Загрузка Artifact в GitHub Actions
-        uses: actions/upload-artifact@v4
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ steps.metadata.outputs.filename }}
-          path: _builds/${{ steps.metadata.outputs.filename }}
-
-      - name: Создание GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true) }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.metadata.outputs.version }}
-          name: Release v${{ steps.metadata.outputs.version }} (${{ steps.metadata.outputs.version_code }})
-          body: |
-            ### 🛡️ Релиз модуля WireGuard KSU (${{ steps.metadata.outputs.id }})
-            - **Версия:** `v${{ steps.metadata.outputs.version }}`
-            - **Код сборки:** `${{ steps.metadata.outputs.version_code }}`
-          draft: false
-          prerelease: false
-          files: |
-            _builds/${{ steps.metadata.outputs.filename }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ steps.meta.outputs.package_name }}
+          path: dist/${{ steps.meta.outputs.package_name }}
+          if-no-files-found: error
